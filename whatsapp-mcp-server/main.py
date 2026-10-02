@@ -246,6 +246,32 @@ def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
             "message": "Failed to download media"
         }
 
+# Ferramentas da bedrock mentorship (atendimento, follow-up, mini-CRM, modelos, grupos)
+import bedrock_tools
+
+for _fn in (
+    bedrock_tools.aguardando_resposta,
+    bedrock_tools.sem_retorno,
+    bedrock_tools.resumo_do_periodo,
+    bedrock_tools.historico_do_contato,
+    bedrock_tools.buscar_em_todas,
+    bedrock_tools.exportar_conversa,
+    bedrock_tools.estatisticas_de_atendimento,
+    bedrock_tools.listar_grupos,
+    bedrock_tools.membros_do_grupo,
+    bedrock_tools.definir_contato,
+    bedrock_tools.listar_por_etiqueta,
+    bedrock_tools.ficha_do_contato,
+    bedrock_tools.agendar_followup,
+    bedrock_tools.followups_pendentes,
+    bedrock_tools.concluir_followup,
+    bedrock_tools.listar_modelos,
+    bedrock_tools.salvar_modelo,
+    bedrock_tools.renderizar_modelo,
+    bedrock_tools.enviar_em_massa,
+):
+    mcp.tool()(_fn)
+
 if __name__ == "__main__":
     # Initialize and run the server
     mcp.run(transport='stdio')

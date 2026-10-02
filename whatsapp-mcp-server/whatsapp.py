@@ -52,7 +52,16 @@ def get_sender_name(sender_jid: str) -> str:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
         
-        # First try matching by exact JID
+        # Contacts table (filled by the bridge: LID/phone -> real name)
+        try:
+            cursor.execute("SELECT name FROM contacts WHERE user = ? LIMIT 1", (sender_jid.split('@')[0],))
+            result = cursor.fetchone()
+        except sqlite3.Error:
+            result = None
+        if result and result[0]:
+            return result[0]
+
+        # Then try matching by exact JID
         cursor.execute("""
             SELECT name
             FROM chats
@@ -329,14 +338,14 @@ def list_chats(
         cursor = conn.cursor()
         
         # Build base query
-        query_parts = ["""
+        query_parts = [f"""
             SELECT 
                 chats.jid,
                 chats.name,
                 chats.last_message_time,
-                messages.content as last_message,
-                messages.sender as last_sender,
-                messages.is_from_me as last_is_from_me
+                {"messages.content" if include_last_message else "NULL"} as last_message,
+                {"messages.sender" if include_last_message else "NULL"} as last_sender,
+                {"messages.is_from_me" if include_last_message else "NULL"} as last_is_from_me
             FROM chats
         """]
         

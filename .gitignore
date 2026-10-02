@@ -1,3 +1,7 @@
 *.db
 claude_desktop_config.json
 whatsapp.log
+exportacoes/
+whatsapp-bridge/whatsapp-bridge.exe
+whatsapp-bridge/store/
+__pycache__/

@@ -10,6 +10,7 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"reflect"
@@ -19,6 +20,7 @@ import (
 
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/mdp/qrterminal"
+	"rsc.io/qr"
 
 	"bytes"
 
@@ -83,6 +85,14 @@ func NewMessageStore() (*MessageStore, error) {
 			file_length INTEGER,
 			PRIMARY KEY (id, chat_jid),
 			FOREIGN KEY (chat_jid) REFERENCES chats(jid)
+		);
+
+		CREATE TABLE IF NOT EXISTS contacts (
+			user TEXT PRIMARY KEY,
+			jid TEXT,
+			phone TEXT,
+			name TEXT,
+			updated_at TIMESTAMP
 		);
 	`)
 	if err != nil {
@@ -641,7 +651,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// Download the media using whatsmeow client
-	mediaData, err := client.Download(downloader)
+	mediaData, err := client.Download(context.Background(), downloader)
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
@@ -723,6 +733,42 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
+	// Handler for group info and members
+	http.HandleFunc("/api/group", func(w http.ResponseWriter, r *http.Request) {
+		jid, err := types.ParseJID(r.URL.Query().Get("jid"))
+		if err != nil || jid.Server != types.GroupServer {
+			http.Error(w, "Invalid group jid", http.StatusBadRequest)
+			return
+		}
+		info, err := client.GetGroupInfo(context.Background(), jid)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		type member struct {
+			JID     string `json:"jid"`
+			Phone   string `json:"phone"`
+			Name    string `json:"name"`
+			IsAdmin bool   `json:"is_admin"`
+		}
+		members := []member{}
+		for _, p := range info.Participants {
+			pj := p.JID
+			if !p.PhoneNumber.IsEmpty() {
+				pj = p.PhoneNumber
+			}
+			name, phone := resolveContact(client, messageStore, p.JID)
+			if name == "" || phone == "" {
+				if n2, ph2 := resolveContact(client, messageStore, pj); n2 != "" {
+					name, phone = n2, ph2
+				}
+			}
+			members = append(members, member{JID: p.JID.String(), Phone: phone, Name: name, IsAdmin: p.IsAdmin || p.IsSuperAdmin})
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{"jid": jid.String(), "name": info.Name, "members": members})
+	})
+
 	// Handler for downloading media
 	http.HandleFunc("/api/download", func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
@@ -775,7 +821,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	})
 
 	// Start the server
-	serverAddr := fmt.Sprintf(":%d", port)
+	serverAddr := fmt.Sprintf("127.0.0.1:%d", port) // loopback only: the API can send messages as the user
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
 
 	// Run server in a goroutine so it doesn't block
@@ -800,14 +846,14 @@ func main() {
 		return
 	}
 
-	container, err := sqlstore.New("sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
 	}
 
 	// Get device store - This contains session information
-	deviceStore, err := container.GetFirstDevice()
+	deviceStore, err := container.GetFirstDevice(context.Background())
 	if err != nil {
 		if err == sql.ErrNoRows {
 			// No device exists, create one
@@ -847,6 +893,19 @@ func main() {
 
 		case *events.Connected:
 			logger.Infof("Connected to WhatsApp")
+			go func() {
+				time.Sleep(5 * time.Second)
+				refreshContactNames(client, messageStore, logger)
+			}()
+
+		case *events.PushName:
+			resolveAndUpdate(client, messageStore, v.JID, logger)
+
+		case *events.Contact:
+			resolveAndUpdate(client, messageStore, v.JID, logger)
+
+		case *events.BusinessName:
+			resolveAndUpdate(client, messageStore, v.JID, logger)
 
 		case *events.LoggedOut:
 			logger.Warnf("Device logged out, please scan QR code to log in again")
@@ -871,6 +930,7 @@ func main() {
 			if evt.Event == "code" {
 				fmt.Println("\nScan this QR code with your WhatsApp app:")
 				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
+				saveQRImage(evt.Code)
 			} else if evt.Event == "success" {
 				connected <- true
 				break
@@ -927,7 +987,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 	// First, check if chat already exists in database with a name
 	var existingName string
 	err := messageStore.db.QueryRow("SELECT name FROM chats WHERE jid = ?", chatJID).Scan(&existingName)
-	if err == nil && existingName != "" {
+	if err == nil && existingName != "" && existingName != jid.User {
 		// Chat exists with a name, use that
 		logger.Infof("Using existing chat name for %s: %s", chatJID, existingName)
 		return existingName
@@ -973,7 +1033,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 		// If we didn't get a name, try group info
 		if name == "" {
-			groupInfo, err := client.GetGroupInfo(jid)
+			groupInfo, err := client.GetGroupInfo(context.Background(), jid)
 			if err == nil && groupInfo.Name != "" {
 				name = groupInfo.Name
 			} else {
@@ -987,15 +1047,12 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		// This is an individual contact
 		logger.Infof("Getting name for contact: %s", chatJID)
 
-		// Just use contact info (full name)
-		contact, err := client.Store.Contacts.GetContact(jid)
-		if err == nil && contact.FullName != "" {
-			name = contact.FullName
-		} else if sender != "" {
-			// Fallback to sender
+		// Resolve through the LID/phone map and the contact store
+		name, _ = resolveContact(client, messageStore, jid)
+		if name == "" && sender != "" {
 			name = sender
-		} else {
-			// Last fallback to JID
+		}
+		if name == "" {
 			name = jid.User
 		}
 
@@ -1007,6 +1064,10 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 // Handle history sync events
 func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, historySync *events.HistorySync, logger waLog.Logger) {
+	defer func() {
+		time.Sleep(2 * time.Second)
+		refreshContactNames(client, messageStore, logger)
+	}()
 	fmt.Printf("Received history sync event with %d conversations\n", len(historySync.Data.Conversations))
 
 	syncedCount := 0
@@ -1087,8 +1148,18 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					if msg.Message.Key.FromMe != nil {
 						isFromMe = *msg.Message.Key.FromMe
 					}
-					if !isFromMe && msg.Message.Key.Participant != nil && *msg.Message.Key.Participant != "" {
-						sender = *msg.Message.Key.Participant
+					participant := ""
+					if msg.Message.Key.Participant != nil {
+						participant = *msg.Message.Key.Participant
+					}
+					if participant == "" && msg.Message.Participant != nil {
+						participant = *msg.Message.Participant
+					}
+					if !isFromMe && participant != "" {
+						sender = participant
+						if pj, perr := types.ParseJID(participant); perr == nil {
+							sender = pj.User
+						}
 					} else if isFromMe {
 						sender = client.Store.ID.User
 					} else {
@@ -1345,4 +1416,143 @@ func placeholderWaveform(duration uint32) []byte {
 	}
 
 	return waveform
+}
+
+// saveQRImage writes the pairing QR as a PNG plus an auto-refreshing HTML page,
+// opened once in the default browser, for terminals that cannot show the QR whole.
+var qrPageOpened bool
+
+func saveQRImage(code string) {
+	c, err := qr.Encode(code, qr.L)
+	if err != nil {
+		return
+	}
+	c.Scale = 10
+	if err := os.WriteFile("store/qr.png", c.PNG(), 0644); err != nil {
+		return
+	}
+	page := `<!doctype html><meta charset="utf-8"><title>QR WhatsApp</title>
+<body style="margin:0;display:grid;place-items:center;height:100vh;background:#fff;font-family:sans-serif">
+<div style="text-align:center"><img id="q" style="width:min(80vmin,520px);image-rendering:pixelated">
+<p>Escaneie com o WhatsApp: Configura&ccedil;&otilde;es &rarr; Dispositivos conectados</p></div>
+<script>const q=document.getElementById('q');function r(){q.src='qr.png?t='+Date.now()}r();setInterval(r,2000)</script></body>`
+	if err := os.WriteFile("store/qr.html", []byte(page), 0644); err != nil {
+		return
+	}
+	if !qrPageOpened {
+		qrPageOpened = true
+		abs, _ := filepath.Abs("store/qr.html")
+		_ = exec.Command("cmd", "/c", "start", "", abs).Start()
+	}
+}
+
+// resolveContact finds the best human name and the phone number for a JID.
+// WhatsApp now identifies people by LID, so the phone is looked up in the LID map
+// and the name in the contact store (address-book name first, then push name).
+func resolveContact(client *whatsmeow.Client, store *MessageStore, jid types.JID) (name string, phone string) {
+	ctx := context.Background()
+	candidates := []types.JID{jid}
+	if jid.Server == types.HiddenUserServer {
+		if pn, err := client.Store.LIDs.GetPNForLID(ctx, jid); err == nil && !pn.IsEmpty() {
+			phone = pn.User
+			candidates = []types.JID{pn, jid}
+		}
+	} else if jid.Server == types.DefaultUserServer {
+		phone = jid.User
+		if lid, err := client.Store.LIDs.GetLIDForPN(ctx, jid); err == nil && !lid.IsEmpty() {
+			candidates = append(candidates, lid)
+		}
+	}
+	for _, c := range candidates {
+		info, err := client.Store.Contacts.GetContact(ctx, c)
+		if err != nil || !info.Found {
+			continue
+		}
+		for _, n := range []string{info.FullName, info.FirstName, info.PushName, info.BusinessName} {
+			if n != "" {
+				name = n
+				break
+			}
+		}
+		if name != "" {
+			break
+		}
+	}
+	if name == "" && phone != "" {
+		name = "+" + phone
+	}
+	store.saveContact(jid, phone, name)
+	return name, phone
+}
+
+// saveContact upserts the resolved contact under both its LID and phone keys.
+func (store *MessageStore) saveContact(jid types.JID, phone, name string) {
+	if name == "" {
+		return
+	}
+	now := time.Now()
+	store.db.Exec("INSERT OR REPLACE INTO contacts (user, jid, phone, name, updated_at) VALUES (?, ?, ?, ?, ?)", jid.User, jid.String(), phone, name, now)
+	if phone != "" && phone != jid.User {
+		store.db.Exec("INSERT OR REPLACE INTO contacts (user, jid, phone, name, updated_at) VALUES (?, ?, ?, ?, ?)", phone, phone+"@"+types.DefaultUserServer, phone, name, now)
+	}
+}
+
+// resolveAndUpdate refreshes one contact and renames its direct chat.
+func resolveAndUpdate(client *whatsmeow.Client, store *MessageStore, jid types.JID, logger waLog.Logger) {
+	name, _ := resolveContact(client, store, jid)
+	if name == "" || jid.Server == types.GroupServer {
+		return
+	}
+	store.db.Exec("UPDATE chats SET name = ? WHERE jid = ?", name, jid.String())
+}
+
+// refreshContactNames renames direct chats and fills the contacts table for every
+// chat and message sender already stored, replacing numeric placeholders by real names.
+func refreshContactNames(client *whatsmeow.Client, store *MessageStore, logger waLog.Logger) {
+	updated := 0
+	rows, err := store.db.Query("SELECT jid FROM chats WHERE jid NOT LIKE '%@g.us'")
+	if err == nil {
+		var jids []string
+		for rows.Next() {
+			var j string
+			if rows.Scan(&j) == nil {
+				jids = append(jids, j)
+			}
+		}
+		rows.Close()
+		for _, j := range jids {
+			jid, perr := types.ParseJID(j)
+			if perr != nil || jid.User == "0" {
+				continue
+			}
+			name, _ := resolveContact(client, store, jid)
+			if name != "" {
+				if res, e := store.db.Exec("UPDATE chats SET name = ? WHERE jid = ? AND name != ?", name, j, name); e == nil {
+					if n, _ := res.RowsAffected(); n > 0 {
+						updated++
+					}
+				}
+			}
+		}
+	}
+	// Senders seen in groups (stored as the bare user part)
+	srows, err := store.db.Query("SELECT DISTINCT sender FROM messages WHERE sender != ''")
+	if err == nil {
+		var users []string
+		for srows.Next() {
+			var u string
+			if srows.Scan(&u) == nil {
+				users = append(users, u)
+			}
+		}
+		srows.Close()
+		for _, u := range users {
+			server := types.DefaultUserServer
+			if _, e := client.Store.LIDs.GetPNForLID(context.Background(), types.NewJID(u, types.HiddenUserServer)); e == nil {
+				server = types.HiddenUserServer
+			}
+			resolveContact(client, store, types.NewJID(u, server))
+		}
+	}
+	logger.Infof("Contact names refreshed (%d chats renamed)", updated)
 }
